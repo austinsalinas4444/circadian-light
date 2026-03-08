@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 CircadianLight is an iOS 17+ app built with SwiftUI that provides personalized lighting recommendations based on health data. The app analyzes HealthKit metrics (HRV, sleep, steps) and uses a backend API to determine optimal color temperature and brightness for smart lighting throughout the day.
 
-**Current Status**: Fully functional iOS app with real HealthKit integration + FastAPI backend with biologically-aware circadian policy. HealthKit is implemented on iOS. WiZ bulb integration is the active lighting control for MVP (replacing Philips Hue). The app gracefully falls back to mock data when HealthKit is unavailable.
+**Current Status**: Fully functional iOS app with real HealthKit integration + FastAPI backend with research-validated 6-phase circadian policy. HealthKit is implemented on iOS. WiZ bulb integration is the active lighting control for MVP. Supabase persistence layer and PyTorch ML infrastructure are implemented but optional (controlled by env vars). The app gracefully falls back to mock data when HealthKit is unavailable.
 
 ## Build Commands
 
@@ -67,10 +67,20 @@ State transitions are managed by `AppViewModel` methods:
 - Custom `CodingKeys` map Swift camelCase ↔ Python snake_case (e.g., `hrvMilliseconds` ↔ `hrv_ms`)
 
 **Backend** (`backend/app/`):
-- `services/circadian_policy.py`: 4-phase circadian model (Morning, Focus, Wind-Down, Night) with health-based adjustments
-- `models/request_models.py`: Pydantic models for incoming health data
-- `models/response_models.py`: Pydantic models for lighting recommendations and feedback
-- `routers/lighting.py`: FastAPI endpoints for `/health-features` and `/feedback`
+- `services/circadian_policy.py`: 6-phase circadian model with recovery mode and research-validated thresholds
+- `models/request_models.py`: Pydantic models for incoming health data (core + extended sleep/ML fields)
+- `models/response_models.py`: Pydantic models for lighting recommendations and feedback (includes `recovery_mode`)
+- `routers/lighting.py`: FastAPI endpoints with ML flag, policy fallback, and async Supabase persistence
+- `db/supabase_client.py`: Supabase client initialization from env vars
+- `db/schemas.py`: Pydantic models for Supabase tables (HealthSnapshot, LightingFeedback, UserSettings)
+- `db/crud.py`: Async CRUD helpers wrapping the sync supabase-py client
+
+**ML Infrastructure** (`backend/ml/`):
+- `models/circadian_net.py`: CircadianNet PyTorch model (8→32→16→2)
+- `preprocessing.py`: FeatureProcessor — z-score normalization, output denormalization
+- `inference.py`: CircadianModelInference — lazy model loading, safe predict() with fallback
+- `training/generate_labels.py`: Builds training_data.csv from health CSVs + policy labels
+- `training/train.py`: Trains CircadianNet, saves to `ml/models/circadian_model.pt`
 
 ### UI Components
 
@@ -93,19 +103,75 @@ State transitions are managed by `AppViewModel` methods:
 
 ## Backend API Details
 
-The FastAPI backend implements a 4-phase circadian lighting policy:
+### 6-Phase Circadian Policy (`backend/app/services/circadian_policy.py`)
 
-1. **Morning Ramp-Up (05:00-09:00)**: 3500-4500K, 60-80% brightness - supports cortisol rise
-2. **Focus (09:00-17:00)**: 4500-5500K, 80-100% brightness - optimizes cognitive performance
-3. **Wind-Down (17:00-21:00)**: 2700-3200K, 40-60% brightness - reduces blue light for melatonin onset
-4. **Night (21:00-05:00)**: 1800-2400K, 10-30% brightness - preserves sleep quality
+Phases are anchored to `WAKE_TIME` (default 8am) and `SLEEP_TIME` (default midnight = 24):
 
-Health metric adjustments:
-- Poor sleep (<6h) → warmer, dimmer light
-- Low HRV (<50ms) → warmer tones to reduce stress
-- High activity (>12,000 steps) → extra dimming in evening for recovery
+| Phase | Hours (default) | CCT | Brightness | Rationale |
+|---|---|---|---|---|
+| **night** | 00:00–06:59 | 2100K | 15% | Preserve melatonin / sleep quality |
+| **wake_ramp** | 07:00–08:59 | 3000→5500K ramp | 50→80% ramp | Support cortisol rise |
+| **morning** | 09:00–10:59 | 5500K | 90% | Peak circadian entrainment |
+| **focus** | 11:00–16:59 | 5000K | 85% | Sustained cognitive performance |
+| **transition** | 17:00–20:59 | 4500→3000K ramp | 70→50% ramp | Begin melatonin onset |
+| **wind_down** | 21:00–23:59 | 2700→2200K ramp | 40→25% ramp | Sleep preparation |
 
-See `backend/README.md` for full API documentation and circadian policy details.
+**Health thresholds (research-validated):**
+- `HRV_LOW = 40ms` — below: stress indicator
+- `HRV_HIGH = 80ms` — above: excellent recovery
+- `SLEEP_HOURS_LOW = 6h` — below: suboptimal quantity
+- `SLEEP_SCORE_LOW = 70` — at/below: recovery mode triggers
+- `ACTIVITY_HIGH = 12,000 steps` — above: high activity day
+
+**Recovery mode** activates when `hrv < 40ms OR sleep_hours < 6h OR sleep_score ≤ 70`:
+- Caps CCT at 3500K
+- Multiplies brightness by 0.70
+- Sets `recovery_mode: true` in response
+
+**Normal health modulation:**
+- Low HRV (40–60ms): −300K, −10% brightness
+- Poor sleep (<6.5h): −200K, −15% brightness
+- High activity (>12k steps) in transition/wind-down: −10% brightness
+
+**`compute_sleep_score(sleep_hours, deep_sleep_pct, rem_sleep_pct, sleep_efficiency)`:**
+```
+score = (sleep_hours/8)*30 + (deep_sleep_pct/0.20)*25 + (rem_sleep_pct/0.25)*25 + sleep_efficiency*20
+```
+Returns 0–100, clamped.
+
+### PyTorch Model Architecture
+
+`CircadianNet` (8 → 32 → ReLU → 16 → ReLU → 2):
+- **Input (8 features):** hrv_ms, sleep_hours, sleep_score, resting_hr, steps, active_energy, hour, day_of_week
+- **Output (2 values):** cct_normalized, brightness_normalized (both in [0,1])
+- **Training:** MSELoss, Adam lr=0.001, 100 epochs, 80/20 split
+- **Activation in USE_ML_MODEL mode:** off by default (`USE_ML_MODEL=false`)
+
+### Supabase Schema
+
+Three tables (create in Supabase dashboard):
+
+**`health_snapshots`**: user_id, timestamp, hrv_ms, sleep_hours, sleep_score, resting_hr, steps, active_energy
+
+**`lighting_feedback`**: user_id, timestamp, recommended_cct, recommended_brightness, actual_cct, actual_brightness, rating (1-5), feedback_type (too_warm/too_cool/too_bright/too_dim/perfect)
+
+**`user_settings`**: user_id, wake_time, sleep_time, bulb_ip
+
+### Training Pipeline
+
+```bash
+cd backend
+# 1. Generate policy-labelled training data from health CSVs
+python -m ml.training.generate_labels
+# → writes ml/training/training_data.csv
+
+# 2. Train CircadianNet
+python -m ml.training.train
+# → writes ml/models/circadian_model.pt
+# → prints MAE for CCT (K) and brightness (%) on validation set
+```
+
+See `backend/README.md` for full API documentation.
 
 ## HealthKit Integration
 
@@ -170,10 +236,19 @@ The app follows a graceful degradation pattern:
 
 **Backend**:
 - `backend/app/main.py` - FastAPI app entry point with CORS configuration
-- `backend/app/services/circadian_policy.py` - Core recommendation logic
-- `backend/app/routers/lighting.py` - API endpoint handlers (calls WiZ after generating recommendation)
+- `backend/app/services/circadian_policy.py` - 6-phase circadian policy with recovery mode
+- `backend/app/routers/lighting.py` - API endpoints with ML flag + async Supabase persistence
 - `backend/app/services/wiz_lighting.py` - WiZ bulb UDP control via pywizlight
-- `backend/requirements.txt` - Python dependencies (fastapi, uvicorn, pydantic, pywizlight)
+- `backend/app/db/supabase_client.py` - Supabase client (requires SUPABASE_URL + SUPABASE_KEY)
+- `backend/app/db/schemas.py` - Supabase table schemas (HealthSnapshot, LightingFeedback, UserSettings)
+- `backend/app/db/crud.py` - Async CRUD helpers
+- `backend/ml/models/circadian_net.py` - PyTorch CircadianNet architecture
+- `backend/ml/preprocessing.py` - Feature normalization and output denormalization
+- `backend/ml/inference.py` - Safe inference wrapper with policy fallback
+- `backend/ml/training/generate_labels.py` - Build training_data.csv from health CSVs
+- `backend/ml/training/train.py` - Train and save circadian_model.pt
+- `backend/requirements.txt` - Python dependencies (fastapi, uvicorn, pydantic, pywizlight, torch, supabase, pandas, numpy)
+- `backend/.env.example` - Environment variable template
 
 ## Development Notes
 
@@ -201,6 +276,10 @@ The app follows a graceful degradation pattern:
 - Test Hue integration by configuring real bridge URL in `AppViewModel` initializer
 
 **Backend**:
-- Test all 4 circadian phases by passing different `local_hour` values (5, 14, 19, 23)
-- Test health metric adjustments by varying `hrv_ms`, `sleep_hours`, and `step_count`
+- Test all 6 circadian phases: `local_hour` values 2, 7, 9, 14, 18, 22
+- Test recovery mode by sending `hrv_ms=35` or `sleep_hours=5`
+- Test health modulation with intermediate HRV (45-60ms) and poor sleep (6.0-6.4h)
+- Verify `recovery_mode: true` appears in response JSON when thresholds are breached
+- Test Supabase persistence by setting SUPABASE_URL + SUPABASE_KEY and sending `user_id`
 - Verify JSON field mapping matches Swift `CodingKeys` in `Models.swift`
+- Test ML pipeline: run `generate_labels.py`, then `train.py`, set `USE_ML_MODEL=true`
